@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC RTSP Player</title>
+    <script src="./jquery.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            padding: 20px;
+            background: #f5f7f9;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .input-group {
+            margin-bottom: 15px;
+        }
+
+        .input-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        .input-group input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 10px;
+        }
+
+        .btn:hover {
+            background: #0056b3;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
+        .video-container {
+            margin-top: 20px;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            height: 500px;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .logs {
+            margin-top: 20px;
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: monospace;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h2>WebRTC RTSP Player</h2>
+
+        <div class="input-group">
+            <label for="rtspurl">RTSP Stream URL</label>
+            <input type="text" id="rtspurl"
+                value="rtsp://admin:CEBON123@192.168.99.115:554/cam/realmonitor?channel=1&subtype=0">
+        </div>
+
+        <div>
+            <button class="btn" onclick="startPlay()">Start Preview</button>
+            <button class="btn btn-danger" onclick="stopPlay()">Stop Preview</button>
+        </div>
+
+        <div class="video-container">
+            <video id="player" autoplay controls muted playsinline></video>
+        </div>
+
+        <div class="logs" id="logs"></div>
+    </div>
+
+    <script>
+        let pc = null;
+        const player = document.getElementById('player');
+        const logs = document.getElementById('logs');
+
+        function log(msg) {
+            const time = new Date().toLocaleTimeString();
+            logs.innerHTML += `[${time}] ${msg}<br>`;
+            logs.scrollTop = logs.scrollHeight;
+            console.log(`[${time}] ${msg}`);
+        }
+
+        async function startPlay() {
+            const rtspUrl = document.getElementById("rtspurl").value;
+            if (!rtspUrl) {
+                alert("Please enter RTSP URL");
+                return;
+            }
+
+            if (pc) {
+                pc.close();
+            }
+
+            log("Initializing WebRTC PeerConnection...");
+            pc = new RTCPeerConnection({
+                // 配置 STUN 服务：这样浏览器除了 mDNS (.local) 候选之外，
+                // 还会生成包含真实 IP 的 srflx 候选，后端可以通过这些 IP 直接连接
+                // iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                iceServers: []
+            });
+
+            // Using a MediaStream to hold incoming tracks
+            const stream = new MediaStream();
+            player.srcObject = stream;
+
+            pc.ontrack = (event) => {
+                log(`Track received. Kind: ${event.track.kind}, ID: ${event.track.id}`);
+                stream.addTrack(event.track);
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                log(`ICE Connection State: ${pc.iceConnectionState}`);
+                if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+                    // 打印目前所有的本地 candidates (为了分析问题)
+                    log(`All local candidates generated: ${pc.localDescription ? pc.localDescription.sdp.match(/a=candidate:.+/g) : "None"}`);
+                    pc.close();
+                }
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    log(`New ICE Candidate gathered: ${event.candidate.candidate}`);
+                } else {
+                    log("ICE Gathering completed (All Candidates collected).");
+                }
+            };
+
+            // Needs explicit transceivers in some browsers when creating offer without local media
+            pc.addTransceiver('video', { direction: 'recvonly' });
+            pc.addTransceiver('audio', { direction: 'recvonly' });
+
+            try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                log("Local offer created and set.");
+
+                // Wait for ICE gathering to complete before sending SDP
+                // Doing it via Promise for cleaner code
+                await new Promise((resolve) => {
+                    if (pc.iceGatheringState === 'complete') {
+                        resolve();
+                    } else {
+                        const checkState = () => {
+                            if (pc.iceGatheringState === 'complete') {
+                                pc.removeEventListener('icegatheringstatechange', checkState);
+                                resolve();
+                            }
+                        };
+                        pc.addEventListener('icegatheringstatechange', checkState);
+                        // Timeout fallback after 2s
+                        setTimeout(resolve, 2000);
+                    }
+                });
+
+                const localSdpBase64 = btoa(pc.localDescription.sdp);
+                log("Sending Request to backend API /app/plugin/rtsp2webrtc...");
+
+                try {
+                    const resp = await fetch("/app/plugin/rtsp2webrtc", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                        body: "data=" + encodeURIComponent(localSdpBase64) + "&rtspUrl=" + encodeURIComponent(rtspUrl)
+                    });
+
+                    const res = await resp.json();
+                    log(`Server response code: ${res.code}, msg: ${res.msg}`);
+
+                    if (res.code !== 0) {
+                        log(`Error from server: ${res.msg}`);
+                        return;
+                    }
+
+                    log("Received answer from server. Setting RemoteDescription...");
+                    const remoteSdp = atob(res.result);
+                    log(`Remote SDP length: ${remoteSdp.length}`);
+
+                    await pc.setRemoteDescription(new RTCSessionDescription({
+                        type: 'answer',
+                        sdp: remoteSdp
+                    }));
+                    log("RemoteDescription set successfully! Waiting for ICE connection...");
+
+                } catch (e) {
+                    log("Error during SDP exchange: " + e.message);
+                    console.error("Full error:", e);
+                }
+
+            } catch (err) {
+                log("WebRTC Error: " + err.message);
+                console.error(err);
+            }
+        }
+
+        function stopPlay() {
+            const rtspUrl = document.getElementById("rtspurl").value;
+            log("Stopping preview...");
+
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            player.srcObject = null;
+
+            $.get("/app/plugin/rtsp2webrtcEnd", { rtspUrl: rtspUrl }, function (res) {
+                let r = typeof res === 'string' ? JSON.parse(res) : res;
+                log(`Server stop response: ${r.msg || r.result}`);
+            });
+        }
+    </script>
+</body>
+
+</html>

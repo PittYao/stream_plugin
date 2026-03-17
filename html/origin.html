@@ -1,0 +1,75 @@
+<script src="./jquery.min.js"></script>
+<div id="remoteVideos"></div> <br />
+rtsp Url<textarea id="rtspurl" >rtsp://admin:CEBON123@192.168.99.115:554/cam/realmonitor?channel=1&subtype=0</textarea><br/>
+Browser base64 Session Description <textarea id="localSessionDescription" readonly="true"></textarea> <br />
+Golang base64 Session Description: <textarea id="remoteSessionDescription"> </textarea> <br/>
+
+<button onclick="window.Clicks()"> Start Session </button>
+<div id="div"></div>
+<script>
+/* eslint-env browser */
+
+
+let log = msg => {
+    document.getElementById('div').innerHTML += msg + '<br>'
+}
+function getWebRtcSdp(callbackSDP){
+    let src=""
+    let pc = new RTCPeerConnection()
+
+    pc.ontrack = function (event) {
+        console.log(event.streams)
+        src=event.streams[0]
+    }
+
+    pc.oniceconnectionstatechange = e => log(pc.iceConnectionState)
+    pc.onicecandidate = event => {
+        if (event.candidate === null) {
+
+           callbackSDP( btoa(pc.localDescription.sdp),function (sdp,callback) {
+               try {
+                   pc.setRemoteDescription(new RTCSessionDescription({type: 'answer', sdp: atob(sdp)}))
+                  setTimeout(function () {
+                      callback(src)
+                  },300)
+               } catch (e) {
+                   alert(e)
+               }
+           })
+
+
+        }
+    }
+
+    pc.createOffer({offerToReceiveVideo: true, offerToReceiveAudio: true}).then(d => pc.setLocalDescription(d)).catch(log)
+
+
+}
+
+
+
+window.Clicks=()=>{
+
+
+        getWebRtcSdp(function (sdp,callback) {
+
+            $.post("/app/plugin/rtsp2webrtc", { data:sdp,"rtspUrl":document.getElementById("rtspurl").value} ,function(data){
+
+                callback(data.result,function(src) {
+
+                    var el = document.createElement("video")
+                    el.width=500
+                    el.srcObject = src
+                    el.autoplay = true
+                    el.controls = true
+                    document.getElementById('remoteVideos').appendChild(el)
+                })
+                // 不用管
+            });
+
+        })
+
+
+
+}
+</script>

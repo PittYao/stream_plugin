@@ -1,0 +1,182 @@
+package services
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
+	"github.com/bluenviron/gortsplib/v4/pkg/url"
+	"github.com/pion/rtp"
+)
+
+// RTSPClient RTSP 客户端封装
+type RTSPClient struct {
+	Client      *gortsplib.Client
+	URI         string
+	SPS         []byte
+	PPS         []byte
+	OnH264Data  func(nalus [][]byte, pts time.Duration)
+	OnAudioData func(samples []byte, pts time.Duration) // G711 PCMA 音频回调
+	HasAudio    bool                                    // 是否存在音频轨道
+
+	closed  bool
+	closeMu sync.Mutex
+}
+
+// NewRTSPClient 创建 RTSP 客户端
+func NewRTSPClient() *RTSPClient {
+	return &RTSPClient{
+		Client: &gortsplib.Client{
+			// 如果内网摄像头可以使用 TCP，一般比 UDP 稳定
+			// Transport: (*gortsplib.Transport)(nil), // 自动
+		},
+	}
+}
+
+// Open 连接到 RTSP 流
+func (r *RTSPClient) Open(rtspURL string) error {
+	r.URI = rtspURL
+
+	u, err := url.Parse(rtspURL)
+	if err != nil {
+		return fmt.Errorf("failed to parse URL: %w", err)
+	}
+
+	// 连接服务器并获取媒体列表
+	err = r.Client.Start(u.Scheme, u.Host)
+	if err != nil {
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+
+	session, _, err := r.Client.Describe(u)
+	if err != nil {
+		r.Client.Close()
+		return fmt.Errorf("failed to describe: %w", err)
+	}
+
+	// 查找 H264 视频媒体格式
+	var forma *format.H264
+	var videoMedia *description.Media
+
+	// 查找 G711 PCMA 音频媒体格式
+	var audioForma *format.G711
+	var audioMedia *description.Media
+
+	for _, m := range session.Medias {
+		for _, f := range m.Formats {
+			if h264Format, ok := f.(*format.H264); ok {
+				forma = h264Format
+				videoMedia = m
+			}
+			if g711Format, ok := f.(*format.G711); ok {
+				if !g711Format.MULaw { // 只取 A-law (PCMA)
+					audioForma = g711Format
+					audioMedia = m
+				}
+			}
+		}
+	}
+
+	if forma == nil {
+		r.Client.Close()
+		return fmt.Errorf("h264 media not found in the stream")
+	}
+
+	// 提取并保存 SPS/PPS
+	if len(forma.SPS) > 0 {
+		r.SPS = forma.SPS
+	}
+	if len(forma.PPS) > 0 {
+		r.PPS = forma.PPS
+	}
+
+	// Setup 视频轨道
+	_, err = r.Client.Setup(session.BaseURL, videoMedia, 0, 0)
+	if err != nil {
+		r.Client.Close()
+		return fmt.Errorf("failed to setup video media: %w", err)
+	}
+
+	// Setup 音频轨道（如果存在）
+	if audioForma != nil && audioMedia != nil {
+		_, err = r.Client.Setup(session.BaseURL, audioMedia, 0, 0)
+		if err != nil {
+			fmt.Printf("[RTSP] Warning: failed to setup audio media: %v\n", err)
+			// 音频 setup 失败不影响视频
+			audioForma = nil
+			audioMedia = nil
+		} else {
+			r.HasAudio = true
+			fmt.Println("[RTSP] Audio track (PCMA/G711) detected and setup")
+		}
+	}
+
+	// 监听并解析 H264 数据
+	rtpDec, err := forma.CreateDecoder()
+	if err != nil {
+		r.Client.Close()
+		return fmt.Errorf("failed to create H264 decoder: %w", err)
+	}
+
+	r.Client.OnPacketRTP(videoMedia, forma, func(pkt *rtp.Packet) {
+		// gortsplib 内部已经对 FU-A 分片包做了极其完善的管理
+		// Decode 会将完整的 Access Unit (组合好的 NALUs) 输出出来
+		nalus, err := rtpDec.Decode(pkt)
+		if err != nil {
+			if err != rtph264.ErrNonStartingPacketAndNoPrevious && err != rtph264.ErrMorePacketsNeeded {
+				// 可以打印异常
+			}
+			return
+		}
+
+		if r.OnH264Data != nil {
+			// v4 gortsplib Decoder 不直接返回 pts，需要依赖 client 配置，这里我们提供估算
+			// 对于 WebRTC 写入，Pion Track.WriteSample 使用 duration 或者时间戳，我们可以不填写，Pion会自动填。
+			r.OnH264Data(nalus, 0)
+		}
+	})
+
+	// 挂载音频 RTP 解码器
+	if audioForma != nil && audioMedia != nil {
+		r.Client.OnPacketRTP(audioMedia, audioForma, func(pkt *rtp.Packet) {
+			if r.OnAudioData != nil {
+				// G711 PCMA 的 RTP payload 直接就是原始的音频采样数据，无需额外解码
+				r.OnAudioData(pkt.Payload, 0)
+			}
+		})
+	}
+
+	_, err = r.Client.Play(nil)
+	if err != nil {
+		r.Client.Close()
+		return fmt.Errorf("failed to play: %w", err)
+	}
+
+	return nil
+}
+
+// Close 关闭连接
+func (r *RTSPClient) Close() {
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+
+	if r.closed {
+		return
+	}
+	r.closed = true
+
+	if r.Client != nil {
+		r.Client.Close()
+	}
+}
+
+// IsClosed 检查是否已关闭
+func (r *RTSPClient) IsClosed() bool {
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	return r.closed
+}
