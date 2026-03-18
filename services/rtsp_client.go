@@ -4,12 +4,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
-
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
-	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/pion/rtp"
 	"github.com/sirupsen/logrus"
@@ -21,9 +18,9 @@ type RTSPClient struct {
 	URI         string
 	SPS         []byte
 	PPS         []byte
-	OnH264Data  func(nalus [][]byte, pts time.Duration)
-	OnAudioData func(samples []byte, pts time.Duration) // G711 PCMA 音频回调
-	HasAudio    bool                                    // 是否存在音频轨道
+	OnH264RTP   func(pkt *rtp.Packet)
+	OnAudioRTP  func(pkt *rtp.Packet) // G711 PCMA 音频 RTP 回调
+	HasAudio    bool                  // 是否存在音频轨道
 
 	closed  bool
 	closeMu sync.Mutex
@@ -125,37 +122,18 @@ func (r *RTSPClient) Open(rtspURL string) error {
 		}
 	}
 
-	// 监听并解析 H264 数据
-	rtpDec, err := forma.CreateDecoder()
-	if err != nil {
-		r.Client.Close()
-		return fmt.Errorf("failed to create H264 decoder: %w", err)
-	}
-
+	// 监听并直接透传 H264 RTP 数据，避免 Decoder 重组 NALU 丢失原始时间戳
 	r.Client.OnPacketRTP(videoMedia, forma, func(pkt *rtp.Packet) {
-		// gortsplib 内部已经对 FU-A 分片包做了极其完善的管理
-		// Decode 会将完整的 Access Unit (组合好的 NALUs) 输出出来
-		nalus, err := rtpDec.Decode(pkt)
-		if err != nil {
-			if err != rtph264.ErrNonStartingPacketAndNoPrevious && err != rtph264.ErrMorePacketsNeeded {
-				// 可以打印异常
-			}
-			return
-		}
-
-		if r.OnH264Data != nil {
-			// v4 gortsplib Decoder 不直接返回 pts，需要依赖 client 配置，这里我们提供估算
-			// 对于 WebRTC 写入，Pion Track.WriteSample 使用 duration 或者时间戳，我们可以不填写，Pion会自动填。
-			r.OnH264Data(nalus, 0)
+		if r.OnH264RTP != nil {
+			r.OnH264RTP(pkt)
 		}
 	})
 
-	// 挂载音频 RTP 解码器
+	// 挂载音频 RTP 监听并透传
 	if audioForma != nil && audioMedia != nil {
 		r.Client.OnPacketRTP(audioMedia, audioForma, func(pkt *rtp.Packet) {
-			if r.OnAudioData != nil {
-				// G711 PCMA 的 RTP payload 直接就是原始的音频采样数据，无需额外解码
-				r.OnAudioData(pkt.Payload, 0)
+			if r.OnAudioRTP != nil {
+				r.OnAudioRTP(pkt)
 			}
 		})
 	}

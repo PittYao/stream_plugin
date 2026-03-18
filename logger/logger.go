@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"io"
 	"os"
 
 	"github.com/sirupsen/logrus"
@@ -30,9 +31,9 @@ func Init() {
 		Compress:   true,                     // 压缩旧日志
 	}
 
-	logrus.SetOutput(lumberjackLogger)
+	// 同时输出到控制台和日志文件
+	multiWriter := io.MultiWriter(os.Stdout, lumberjackLogger)
+	logrus.SetOutput(multiWriter)
+
 	logrus.SetLevel(logrus.InfoLevel)
-	
-	// 在控制台也输出一份，方便调试时查看
-	logrus.SetOutput(os.Stdout)
 }

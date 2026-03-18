@@ -1,0 +1,339 @@
+
+// import (
+// 	"bytes"
+// 	"code.hoteas.com/hoteas/hotime"
+// 	"encoding/base64"
+// 	"fmt"
+// 	"github.com/deepch/sample_rtsp"
+// 	"github.com/ghettovoice/gosip/log"
+// 	"github.com/pion/webrtc"
+// 	"github.com/pion/webrtc/pkg/media"
+// 	"io"
+// 	"math/rand"
+// 	"net"
+// 	"os"
+// 	"os/exec"
+// 	"path/filepath"
+// 	"strings"
+// 	"sync"
+// 	"syscall"
+// 	"time"
+// )
+
+// var FFmpegs = map[string]*ffmpegCmd{}      //转流实例
+// var SaveVideoIns = map[string]*ffmpegCmd{} //下载实例
+
+// var FfmpegMutex = sync.RWMutex{}
+// var WebRtcMutex = sync.RWMutex{}
+
+// type ffmpegCmd struct {
+// 	Ins   *exec.Cmd
+// 	Time  int64
+// 	path  string
+// 	uri   string
+// 	Stdin io.WriteCloser
+// }
+
+// var WebRtcs = map[string]*webrtcClient{}               //转流实例
+// var ConnWebRtcIns = map[string]map[string]*webrtcCmd{} //下载实例/uri/sdp/
+
+// type webrtcClient struct {
+// 	Client     *rtsp.RtspClient
+// 	Time       int64
+// 	uri        string
+// 	mediaDatas []*media.Sample
+// }
+
+// type webrtcCmd struct {
+// 	sdp   string
+// 	track *webrtc.Track
+// 	Time  int64
+// 	uri   string
+// }
+
+// var videoTracks = map[string]*webrtc.Track{}
+
+// var PluginCtr = hotime.Ctr{
+// 	"rtsp2webrtc": func(this *hotime.Context) {
+
+// 		//启动rtsp转换rtmp，如果已经启动则
+// 		RunWebRtc(this.Req.FormValue("rtspUrl"), this)
+// 		data := this.Req.FormValue("data")
+// 		this.Display(0, WebRTCSDPGet(this.Req.FormValue("rtspUrl"), data, this))
+
+// 	},
+
+// 	"rtsp2webrtcEnd": func(this *hotime.Context) {
+// 		log.Println("结束之前 ", WebRtcs)
+// 		rtspUrl := this.Req.FormValue("rtspUrl")
+// 		if rtspUrl == "" {
+// 			this.Display(-1, "没有传rtspUrl")
+// 			return
+// 		}
+// 		client, ok := WebRtcs[rtspUrl]
+// 		log.Println(WebRtcs, ok)
+// 		if ok {
+// 			client.Client.Close()
+// 			delete(WebRtcs, rtspUrl)
+
+// 			log.Println("删除之前 ", ConnWebRtcIns)
+
+// 			if _, exist := ConnWebRtcIns[rtspUrl]; exist {
+// 				delete(ConnWebRtcIns, rtspUrl)
+// 				log.Println("删除之后 ", ConnWebRtcIns)
+// 			}
+
+// 			this.Display(0, "关闭成功")
+// 		} else {
+// 			this.Display(-1, "该rtspUrl地址没有在转换")
+// 		}
+// 	},
+
+// }
+
+// func WebRTCSDPGet(rtspUrl, data string, this *hotime.Context) string {
+
+// 	//this.Resp.Header().Set("Access-Control-Allow-Origin", "*")
+
+// 	md5Data := hotime.Md5(data)
+// 	WebRtcMutex.Lock()
+
+// 	if ConnWebRtcIns[rtspUrl] == nil {
+// 		ConnWebRtcIns[rtspUrl] = map[string]*webrtcCmd{}
+// 	}
+// 	ins := ConnWebRtcIns[rtspUrl][md5Data]
+// 	if ins != nil {
+
+// 		ins.Time = time.Now().Unix() + this.Config.GetCeilInt64("rtmpAddTime")
+// 		ConnWebRtcIns[rtspUrl][md5Data] = ins
+// 		WebRtcMutex.Unlock()
+// 		return ins.sdp
+
+// 	}
+
+// 	WebRtcMutex.Unlock()
+
+// 	sd, err := base64.StdEncoding.DecodeString(data)
+
+// 	if videoTracks[data] != nil {
+// 		return ""
+// 	}
+
+// 	if err != nil {
+// 		log.Println(err)
+// 		return ""
+// 	}
+// 	// webrtc.RegisterDefaultCodecs()
+// 	//peerConnection, err := webrtc.New(webrtc.RTCConfiguration{
+// 	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
+// 		ICEServers: []webrtc.ICEServer{
+// 			//{
+// 			//	URLs: []string{"stun:stun.l.google.com:19302"},
+// 			//},
+// 		},
+// 	})
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+// 		fmt.Printf("Connection State has changed %s \n", connectionState.String())
+// 	})
+// 	vp8Track, err := peerConnection.NewTrack(webrtc.DefaultPayloadTypeH264, rand.Uint32(), "video", "pion2")
+// 	if err != nil {
+// 		log.Println(err)
+// 		return ""
+// 	}
+// 	_, err = peerConnection.AddTrack(vp8Track)
+// 	if err != nil {
+// 		log.Println(err)
+// 		return ""
+// 	}
+// 	offer := webrtc.SessionDescription{
+// 		Type: webrtc.SDPTypeOffer,
+// 		SDP:  string(sd),
+// 	}
+// 	if err := peerConnection.SetRemoteDescription(offer); err != nil {
+// 		log.Println(err)
+// 		return ""
+// 	}
+// 	answer, err := peerConnection.CreateAnswer(nil)
+// 	if err != nil {
+// 		log.Println(err)
+// 		return ""
+// 	}
+// 	//this.Resp.Write([]byte())
+
+// 	// DataChanelTest = vp8Track.Samples
+// 	//videoTrack = vp8Track
+// 	tracks := webrtcCmd{sdp: base64.StdEncoding.EncodeToString([]byte(answer.SDP)), Time: time.Now().Unix() + this.Config.GetCeilInt64("rtmpAddTime"), uri: rtspUrl}
+// 	tracks.track = vp8Track
+
+// 	if WebRtcs[rtspUrl] != nil {
+// 		datas := WebRtcs[rtspUrl].mediaDatas
+// 		go func(datas []*media.Sample, tracks *webrtcCmd) {
+// 			for _, v := range datas {
+// 				tracks.track.WriteSample(*v)
+// 				time.Sleep(5 * time.Millisecond)
+// 			}
+
+// 			WebRtcMutex.Lock()
+// 			ConnWebRtcIns[rtspUrl][md5Data] = tracks
+// 			WebRtcMutex.Unlock()
+
+// 		}(datas, &tracks)
+// 	}
+
+// 	return tracks.sdp
+// }
+
+// func RunWebRtc(rtspUrl string, this *hotime.Context) {
+
+// 	fmt.Println(rtspUrl)
+// 	WebRtcMutex.Lock()
+
+// 	if ins, ok := WebRtcs[rtspUrl]; ok {
+
+// 		ins.Time = time.Now().Unix() + this.Config.GetCeilInt64("rtmpAddTime")
+// 		WebRtcs[rtspUrl] = ins
+// 		WebRtcMutex.Unlock()
+
+// 		return
+
+// 	}
+
+// 	WebRtcMutex.Unlock()
+
+// 	go func(rtspUrl string) {
+
+// 		sps := []byte{}
+// 		pps := []byte{}
+// 		fuBuffer := []byte{}
+// 		count := 0
+// 		Client := rtsp.RtspClientNew()
+
+// 		rtspClient := webrtcClient{Client: Client, Time: time.Now().Unix() + this.Config.GetCeilInt64("rtmpAddTime"), uri: rtspUrl, mediaDatas: []*media.Sample{}}
+
+// 		WebRtcMutex.Lock()
+// 		WebRtcs[rtspUrl] = &rtspClient
+// 		WebRtcMutex.Unlock()
+
+// 		Client.Debug = false
+// 		syncCount := 0
+// 		preTS := 0
+// 		writeNALU := func(sync bool, ts int, payload []byte) {
+// 			// if DataChanelTest != nil && preTS != 0 {
+// 			// 	DataChanelTest <- webrtc.RTCSample{Data: payload, Samples: uint32(ts - preTS)}
+// 			// }
+// 			mediaData := media.Sample{Data: payload, Samples: uint32(ts - preTS)}
+// 			WebRtcMutex.Lock()
+// 			defer WebRtcMutex.Unlock()
+
+// 			if ConnWebRtcIns[rtspUrl] == nil {
+// 				ConnWebRtcIns[rtspUrl] = map[string]*webrtcCmd{}
+// 			}
+
+// 			WebRtcClient := WebRtcs[rtspUrl]
+// 			if WebRtcClient != nil {
+// 				datas := WebRtcClient.mediaDatas
+// 				datas = append(datas, &mediaData)
+// 				if len(datas) > 150 {
+// 					datas = datas[len(datas)-150:]
+// 				}
+// 				WebRtcClient.mediaDatas = datas
+
+// 				if len(ConnWebRtcIns[rtspUrl]) != 0 && preTS != 0 {
+// 					for _, v := range ConnWebRtcIns[rtspUrl] {
+// 						v.track.WriteSample(mediaData)
+// 					}
+// 				}
+
+// 				preTS = ts
+// 			}
+
+// 		}
+// 		handleNALU := func(nalType byte, payload []byte, ts int64) {
+// 			if nalType == 7 {
+// 				if len(sps) == 0 {
+// 					sps = payload
+// 				}
+// 				//	writeNALU(true, int(ts), payload)
+// 			} else if nalType == 8 {
+// 				if len(pps) == 0 {
+// 					pps = payload
+// 				}
+// 				//	writeNALU(true, int(ts), payload)
+// 			} else if nalType == 5 {
+// 				syncCount++
+// 				lastkeys := append([]byte("\000\000\001"+string(sps)+"\000\000\001"+string(pps)+"\000\000\001"), payload...)
+
+// 				writeNALU(true, int(ts), lastkeys)
+// 			} else {
+// 				if syncCount > 0 {
+// 					writeNALU(false, int(ts), payload)
+// 				}
+// 			}
+// 		}
+// 		if err := Client.Open(rtspUrl); err != nil {
+// 			fmt.Println("[RTSP] Error", err)
+// 		} else {
+// 			for {
+// 				select {
+// 				case <-Client.Signals:
+// 					fmt.Println("Exit signals by rtsp")
+// 					WebRtcMutex.Lock()
+// 					delete(WebRtcs, rtspUrl)
+// 					WebRtcMutex.Unlock()
+// 					return
+// 				case data := <-Client.Outgoing:
+// 					count += len(data)
+// 					//fmt.Println("recive  rtp packet size", len(data), "recive all packet size", count)
+// 					if data[0] == 36 && data[1] == 0 {
+// 						cc := data[4] & 0xF
+// 						rtphdr := 12 + cc*4
+// 						ts := (int64(data[8]) << 24) + (int64(data[9]) << 16) + (int64(data[10]) << 8) + (int64(data[11]))
+// 						packno := (int64(data[6]) << 8) + int64(data[7])
+// 						if false {
+// 							log.Println("packet num", packno)
+// 						}
+// 						nalType := data[4+rtphdr] & 0x1F
+// 						if nalType >= 1 && nalType <= 23 {
+// 							if nalType == 6 {
+// 								continue
+// 							}
+// 							handleNALU(nalType, data[4+rtphdr:], ts)
+// 						} else if nalType == 28 {
+// 							isStart := data[4+rtphdr+1]&0x80 != 0
+// 							isEnd := data[4+rtphdr+1]&0x40 != 0
+// 							nalType := data[4+rtphdr+1] & 0x1F
+// 							nal := data[4+rtphdr]&0xE0 | data[4+rtphdr+1]&0x1F
+// 							if isStart {
+// 								fuBuffer = []byte{0}
+// 							}
+// 							fuBuffer = append(fuBuffer, data[4+rtphdr+2:]...)
+// 							if isEnd {
+// 								fuBuffer[0] = nal
+// 								handleNALU(nalType, fuBuffer, ts)
+// 							}
+// 						}
+// 					} else if data[0] == 36 && data[1] == 2 {
+// 						//cc := data[4] & 0xF
+// 						//rtphdr := 12 + cc*4
+// 						//payload := data[4+rtphdr+4:]
+// 					}
+// 				}
+// 			}
+// 		}
+
+// 		Client.Close()
+
+// 		WebRtcMutex.Lock()
+// 		delete(WebRtcs, rtspUrl)
+// 		WebRtcMutex.Unlock()
+
+// 	}(rtspUrl)
+
+// 	log.Println("开始转流 ", WebRtcs)
+
+// 	return
+
+// }

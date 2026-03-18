@@ -8,10 +8,10 @@ import (
 
 	"github.com/PittYao/stream_plugin/config"
 	"github.com/google/uuid"
-	"github.com/pion/interceptor"
 	pionice "github.com/pion/ice/v4"
+	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/sirupsen/logrus"
 )
 
@@ -36,8 +36,8 @@ type WebRTCClient struct {
 // Viewer 代表一个看流的 WebRTC 客户端
 type Viewer struct {
 	ID             string
-	Track          *webrtc.TrackLocalStaticSample
-	AudioTrack     *webrtc.TrackLocalStaticSample // PCMA 音频轨道
+	Track          *webrtc.TrackLocalStaticRTP
+	AudioTrack     *webrtc.TrackLocalStaticRTP // PCMA 音频 RTP 轨道
 	PeerConnection *webrtc.PeerConnection
 	Expiration     int64
 	ErrorCount     int // 连续写入失败计数
@@ -111,36 +111,36 @@ func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, string, error)
 		return "", "", fmt.Errorf("failed to create peer connection: %w", err)
 	}
 
-	// 创建视频轨道 (H264)
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(
+	// 创建视频 RTP 轨道 (H264)
+	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
 		"video",
 		"pion2",
 	)
 	if err != nil {
 		peerConnection.Close()
-		return "", "", fmt.Errorf("failed to create video track: %w", err)
+		return "", "", fmt.Errorf("failed to create video RTP track: %w", err)
 	}
 
 	if _, err = peerConnection.AddTrack(videoTrack); err != nil {
 		peerConnection.Close()
-		return "", "", fmt.Errorf("failed to add video track: %w", err)
+		return "", "", fmt.Errorf("failed to add video RTP track: %w", err)
 	}
 
-	// 创建音频轨道 (PCMA / G.711 A-law)
-	audioTrack, err := webrtc.NewTrackLocalStaticSample(
+	// 创建音频 RTP 轨道 (PCMA / G.711 A-law)
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMA, ClockRate: 8000, Channels: 1},
 		"audio",
 		"pion2",
 	)
 	if err != nil {
 		peerConnection.Close()
-		return "", "", fmt.Errorf("failed to create audio track: %w", err)
+		return "", "", fmt.Errorf("failed to create audio RTP track: %w", err)
 	}
 
 	if _, err = peerConnection.AddTrack(audioTrack); err != nil {
 		peerConnection.Close()
-		return "", "", fmt.Errorf("failed to add audio track: %w", err)
+		return "", "", fmt.Errorf("failed to add audio RTP track: %w", err)
 	}
 
 	// 监听连接状态并处理清理
@@ -206,18 +206,8 @@ func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, string, error)
 	client.viewers[viewerID] = viewer
 	client.mu.Unlock()
 
-	// 等待 RTSP 开始接收，立即为它发送缓存的 SPS/PPS 以保证开播速度
-	go func() {
-		<-client.Ready
-		if client.RTSPClient != nil && client.RTSPClient.SPS != nil && client.RTSPClient.PPS != nil {
-			sps := append([]byte{0x00, 0x00, 0x00, 0x01}, client.RTSPClient.SPS...)
-			pps := append([]byte{0x00, 0x00, 0x00, 0x01}, client.RTSPClient.PPS...)
-
-			// pion/webrtc 的 WriteSample 支持包含多个起止码的完整 payload
-			payload := append(sps, pps...)
-			videoTrack.WriteSample(media.Sample{Data: payload, Duration: 0})
-		}
-	}()
+	// 此时因为我们改成了透传，如果没有 I 帧观众会一直黑屏，这里不再发送空时长的 Sample 缓存。
+	// WebRTC 对于 RTP 通道的解析是强制依赖关键帧起始的。因此移除旧的 SPS/PPS 直接拼凑。
 
 	return answerSDP, viewerID, nil
 }
@@ -311,20 +301,8 @@ func runRTSPClient(client *WebRTCClient, timeout int64) {
 
 	client.RTSPClient = rtspClient
 
-	// 设置向 Track 写入的回调
-	rtspClient.OnH264Data = func(nalus [][]byte, pts time.Duration) {
-		// gortsplib v4 解出的 NALU 不带 Annex B start code (0x00, 0x00, 0x00, 0x01)
-		// 我们必须在送给 webrtc track 前加上 start code
-		var payload []byte
-		for _, nalu := range nalus {
-			payload = append(payload, []byte{0x00, 0x00, 0x00, 0x01}...)
-			payload = append(payload, nalu...)
-		}
-
-		if len(payload) == 0 {
-			return
-		}
-
+	// 优化后的透传：RTSP 截获的原始 RTP 包
+	rtspClient.OnH264RTP = func(pkt *rtp.Packet) {
 		client.mu.RLock()
 		viewers := make([]*Viewer, 0, len(client.viewers))
 		for _, v := range client.viewers {
@@ -333,24 +311,27 @@ func runRTSPClient(client *WebRTCClient, timeout int64) {
 		client.mu.RUnlock()
 
 		for _, v := range viewers {
-			if err := v.Track.WriteSample(media.Sample{Data: payload, Duration: pts}); err != nil {
-				v.ErrorCount++
-				if v.ErrorCount > 100 {
-					logrus.Warnf("Viewer %s reached error threshold writing video payload, forcing close", v.ID)
-					removeViewer(client, v.ID)
+			if v.Track != nil {
+				// Webrtc 视频 Track 发送 RTP 前不需要修改时间戳和序列号，
+				// pion 会自动利用 Track 底层的 state machine 和 interceptor 进行重制。
+				// 我们需要传入的只是打包好 Payload 的 rtp.Packet 拷贝 (不直接改指针防止并发竞争)
+				outPkt := *pkt
+
+				if err := v.Track.WriteRTP(&outPkt); err != nil {
+					v.ErrorCount++
+					if v.ErrorCount > 100 {
+						logrus.Warnf("Viewer %s reached error threshold writing video RTP, forcing close", v.ID)
+						removeViewer(client, v.ID)
+					}
+				} else {
+					v.ErrorCount = 0
 				}
-			} else {
-				v.ErrorCount = 0 // 重置计数
 			}
 		}
 	}
 
-	// 设置音频回调：将 PCMA 音频数据广播给所有 WebRTC 观看者
-	rtspClient.OnAudioData = func(samples []byte, pts time.Duration) {
-		if len(samples) == 0 {
-			return
-		}
-
+	// 音频透传
+	rtspClient.OnAudioRTP = func(pkt *rtp.Packet) {
 		client.mu.RLock()
 		viewers := make([]*Viewer, 0, len(client.viewers))
 		for _, v := range client.viewers {
@@ -360,14 +341,11 @@ func runRTSPClient(client *WebRTCClient, timeout int64) {
 
 		for _, v := range viewers {
 			if v.AudioTrack != nil {
-				// G711 PCMA: 8000Hz, 每个样本 1 字节, 每帧通常 160 样本 = 20ms
-				duration := time.Duration(len(samples)) * time.Second / 8000
-				if err := v.AudioTrack.WriteSample(media.Sample{Data: samples, Duration: duration}); err != nil {
+				outPkt := *pkt
+
+				if err := v.AudioTrack.WriteRTP(&outPkt); err != nil {
 					v.ErrorCount++
-					if v.ErrorCount > 100 {
-						logrus.Warnf("Viewer %s reached error threshold writing audio payload, forcing close", v.ID)
-						removeViewer(client, v.ID)
-					}
+					// 可以复用 ErrorCount 获取，也可分开，暂复用
 				}
 			}
 		}
