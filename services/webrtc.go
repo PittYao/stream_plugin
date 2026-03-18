@@ -1,15 +1,18 @@
 package services
 
 import (
-	"crypto/md5"
 	"encoding/base64"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/PittYao/stream_plugin/config"
+	"github.com/google/uuid"
+	"github.com/pion/interceptor"
 	pionice "github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -24,8 +27,10 @@ type WebRTCClient struct {
 	Ready      chan struct{} // 就绪信号
 
 	// 连接管理
-	mu      sync.RWMutex
-	viewers map[string]*Viewer
+	mu         sync.RWMutex
+	viewers    map[string]*Viewer
+	timerMutex sync.Mutex
+	timer      *time.Timer
 }
 
 // Viewer 代表一个看流的 WebRTC 客户端
@@ -35,10 +40,11 @@ type Viewer struct {
 	AudioTrack     *webrtc.TrackLocalStaticSample // PCMA 音频轨道
 	PeerConnection *webrtc.PeerConnection
 	Expiration     int64
+	ErrorCount     int // 连续写入失败计数
 }
 
 // StartWebRTC 启动 WebRTC 转流
-func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, error) {
+func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, string, error) {
 	// 确保 RTSP 客户端存在，如果不存在则拉流
 	webRTCMutex.Lock()
 	client, ok := webRtcs[rtspURL]
@@ -54,44 +60,55 @@ func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, error) {
 	}
 	webRTCMutex.Unlock()
 
-	md5Data := fmt.Sprintf("%x", md5.Sum([]byte(sdpData)))
+	// 检查并停止之前的 cleanup timer（如果有）
+	client.timerMutex.Lock()
+	if client.timer != nil {
+		client.timer.Stop()
+		client.timer = nil
+	}
+	client.timerMutex.Unlock()
 
 	// 解析 SDP
 	sd, err := base64.StdEncoding.DecodeString(sdpData)
 	if err != nil {
-		return "", fmt.Errorf("failed to decode SDP: %w", err)
+		return "", "", fmt.Errorf("failed to decode SDP: %w", err)
 	}
 
-	// 检查是否已存在该Viewer
-	client.mu.Lock()
-	if v, exists := client.viewers[md5Data]; exists {
-		v.Expiration = time.Now().Unix() + timeout
-		client.mu.Unlock()
-		return base64.StdEncoding.EncodeToString([]byte(v.PeerConnection.LocalDescription().SDP)), nil
-	}
-	client.mu.Unlock()
+	viewerID := uuid.New().String()
 
-	// 创建支持 mDNS 解析的 Pion WebRTC API
-	// Chrome 会生成 `.local` mDNS 候选，Pion 默认无法解析
-	// 使用 QueryOnly 模式：Pion 可以解析浏览器发来的 .local 地址，
-	// 同时 Pion 自己仍然发送真实的 IP 地址候选（而不是 .local 地址）
+	// 由于改为每次都生成新的 viewerID，我们不再检查相同的 SDP 是否已存在
+	// 前端页面每次刷新应该建立新的 UUID 即可，如果有老的死连接，靠 ConnectionStateFailed 剔除
+
+
+	// 创建支持 mDNS 解析和 NACK 重传的 Pion WebRTC API
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterDefaultCodecs(); err != nil {
+		return "", "", fmt.Errorf("failed to register default codecs: %w", err)
+	}
+
+	// 注册默认拦截器（包含 NACK、TWCC、RTCP Reports 的处理），这对于防止丢包卡顿至关重要
+	i := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+		return "", "", fmt.Errorf("failed to register default interceptors: %w", err)
+	}
+
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.SetICEMulticastDNSMode(pionice.MulticastDNSModeQueryOnly)
 
-	webrtcAPI := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
+	webrtcAPI := webrtc.NewAPI(
+		webrtc.WithSettingEngine(settingEngine),
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(i),
+	)
 
-	// 创建 PeerConnection
+	// 创建 PeerConnection，从 config.json 获取 ICE Servers (如果是空则不使用 STUN)
 	webrtcConfig := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
-		},
+		ICEServers: config.GetICEServers(),
 	}
 
 	peerConnection, err := webrtcAPI.NewPeerConnection(webrtcConfig)
 	if err != nil {
-		return "", fmt.Errorf("failed to create peer connection: %w", err)
+		return "", "", fmt.Errorf("failed to create peer connection: %w", err)
 	}
 
 	// 创建视频轨道 (H264)
@@ -102,12 +119,12 @@ func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, error) {
 	)
 	if err != nil {
 		peerConnection.Close()
-		return "", fmt.Errorf("failed to create video track: %w", err)
+		return "", "", fmt.Errorf("failed to create video track: %w", err)
 	}
 
 	if _, err = peerConnection.AddTrack(videoTrack); err != nil {
 		peerConnection.Close()
-		return "", fmt.Errorf("failed to add video track: %w", err)
+		return "", "", fmt.Errorf("failed to add video track: %w", err)
 	}
 
 	// 创建音频轨道 (PCMA / G.711 A-law)
@@ -118,31 +135,29 @@ func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, error) {
 	)
 	if err != nil {
 		peerConnection.Close()
-		return "", fmt.Errorf("failed to create audio track: %w", err)
+		return "", "", fmt.Errorf("failed to create audio track: %w", err)
 	}
 
 	if _, err = peerConnection.AddTrack(audioTrack); err != nil {
 		peerConnection.Close()
-		return "", fmt.Errorf("failed to add audio track: %w", err)
+		return "", "", fmt.Errorf("failed to add audio track: %w", err)
 	}
 
 	// 监听连接状态并处理清理
 	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		fmt.Printf("Peer Connection State has changed: %s\n", s.String())
+		logrus.Infof("WebRTC Peer Connection State has changed: %s (Viewer=%s)", s.String(), viewerID)
 		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
-			client.mu.Lock()
-			delete(client.viewers, md5Data)
-			client.mu.Unlock()
+			removeViewer(client, viewerID)
 		}
 	})
 
 	// 打印本地生成的 ICE Candidate
 	peerConnection.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
-			fmt.Println("Backend ICE Gathering Completed")
+			logrus.Debugf("Backend ICE Gathering Completed (Viewer=%s)", viewerID)
 			return
 		}
-		fmt.Printf("Backend generated ICE Candidate: %s\n", c.String())
+		logrus.Debugf("Backend generated ICE Candidate: %s (Viewer=%s)", c.String(), viewerID)
 	})
 
 	// 设置远端 SDP
@@ -153,32 +168,34 @@ func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, error) {
 
 	if err := peerConnection.SetRemoteDescription(offer); err != nil {
 		peerConnection.Close()
-		return "", fmt.Errorf("failed to set remote description: %w", err)
+		return "", "", fmt.Errorf("failed to set remote description: %w", err)
 	}
 
 	// 创建 answer
 	answer, err := peerConnection.CreateAnswer(nil)
 	if err != nil {
 		peerConnection.Close()
-		return "", fmt.Errorf("failed to create answer: %w", err)
+		return "", "", fmt.Errorf("failed to create answer: %w", err)
 	}
 
-	// === 修改点：立即将生成的 SDP 发给客户端，不等待 ICE 收集 ===
+	// === 修改点：等待包含 candidate 的 Answer ===
+	// 使用 pion 提供的 gatherCompletePromise
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+
 	if err = peerConnection.SetLocalDescription(answer); err != nil {
 		peerConnection.Close()
-		return "", fmt.Errorf("failed to set local description: %w", err)
+		return "", "", fmt.Errorf("failed to set local description: %w", err)
 	}
 
-	// 等待非常短的时间(50ms)让 Pion 收集到 host candidate (因为 host 是毫秒级的)
-	// 这样可以避免完全没有 IP 的空白 SDP 或者导致 GatheringCompletePromise 死锁
-	time.Sleep(50 * time.Millisecond)
+	// 阻塞等待 ICE 收集完成 (由于没有实现前端 Trickle ICE，需要收集完一并发送)
+	<-gatherComplete
 
-	// 获取包含本地描述（至少包含 host candidates）
+	// 获取包含本地描述（此时必然包含 host/srflx candidates）
 	localDesc := peerConnection.LocalDescription()
 	answerSDP := base64.StdEncoding.EncodeToString([]byte(localDesc.SDP))
 
 	viewer := &Viewer{
-		ID:             md5Data,
+		ID:             viewerID,
 		Track:          videoTrack,
 		AudioTrack:     audioTrack,
 		PeerConnection: peerConnection,
@@ -186,7 +203,7 @@ func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, error) {
 	}
 
 	client.mu.Lock()
-	client.viewers[md5Data] = viewer
+	client.viewers[viewerID] = viewer
 	client.mu.Unlock()
 
 	// 等待 RTSP 开始接收，立即为它发送缓存的 SPS/PPS 以保证开播速度
@@ -202,16 +219,56 @@ func StartWebRTC(rtspURL, sdpData string, timeout int64) (string, error) {
 		}
 	}()
 
-	return answerSDP, nil
+	return answerSDP, viewerID, nil
 }
 
-// StopWebRTC 停止整个 RTSP 流及其所有 WebRTC 连接
-func StopWebRTC(rtspURL string) error {
+// removeViewer 从 client 中安全移除 viewer，如果 viewers 归零则启动定时清理机制
+func removeViewer(client *WebRTCClient, viewerID string) {
+	client.mu.Lock()
+	if v, exists := client.viewers[viewerID]; exists {
+		v.PeerConnection.Close()
+		delete(client.viewers, viewerID)
+		logrus.Infof("Viewer removed: %s, remaining viewers: %d", viewerID, len(client.viewers))
+	} else {
+		client.mu.Unlock()
+		return // 已经被删除了
+	}
+
+	count := len(client.viewers)
+	client.mu.Unlock()
+
+	// 启动延时清理 RTSP 流的任务
+	if count == 0 {
+		client.timerMutex.Lock()
+		if client.timer == nil {
+			client.timer = time.AfterFunc(10*time.Second, func() {
+				webRTCMutex.Lock()
+				// 再次判断 map 中是否确实还是0 人，有可能在 10s 内又进来了人
+				client.mu.RLock()
+				finalCount := len(client.viewers)
+				client.mu.RUnlock()
+
+				if finalCount == 0 {
+					logrus.Infof("No viewers for RTSP %s for 10s, closing RTSP client.", client.URI)
+					if client.RTSPClient != nil {
+						client.RTSPClient.Close()
+					}
+					delete(webRtcs, client.URI)
+				}
+				webRTCMutex.Unlock()
+			})
+		}
+		client.timerMutex.Unlock()
+	}
+}
+
+// ForceStopAllWebRTC 立即强制停止整个 RTSP 流及其所有 WebRTC 连接 (备用)
+func ForceStopAllWebRTC(rtspURL string) error {
 	webRTCMutex.Lock()
 	client, ok := webRtcs[rtspURL]
 	if !ok {
 		webRTCMutex.Unlock()
-		return fmt.Errorf("rtsp url %s not found", rtspURL)
+		return fmt.Errorf("rtsp url %s not found (already closed)", rtspURL)
 	}
 	delete(webRtcs, rtspURL)
 	webRTCMutex.Unlock()
@@ -277,7 +334,13 @@ func runRTSPClient(client *WebRTCClient, timeout int64) {
 
 		for _, v := range viewers {
 			if err := v.Track.WriteSample(media.Sample{Data: payload, Duration: pts}); err != nil {
-				// 忽略失败
+				v.ErrorCount++
+				if v.ErrorCount > 100 {
+					logrus.Warnf("Viewer %s reached error threshold writing video payload, forcing close", v.ID)
+					removeViewer(client, v.ID)
+				}
+			} else {
+				v.ErrorCount = 0 // 重置计数
 			}
 		}
 	}
@@ -300,14 +363,18 @@ func runRTSPClient(client *WebRTCClient, timeout int64) {
 				// G711 PCMA: 8000Hz, 每个样本 1 字节, 每帧通常 160 样本 = 20ms
 				duration := time.Duration(len(samples)) * time.Second / 8000
 				if err := v.AudioTrack.WriteSample(media.Sample{Data: samples, Duration: duration}); err != nil {
-					// 忽略失败
+					v.ErrorCount++
+					if v.ErrorCount > 100 {
+						logrus.Warnf("Viewer %s reached error threshold writing audio payload, forcing close", v.ID)
+						removeViewer(client, v.ID)
+					}
 				}
 			}
 		}
 	}
 
 	if err := rtspClient.Open(rtspURL); err != nil {
-		fmt.Printf("[RTSP] Error opening %s: %v\n", rtspURL, err)
+		logrus.Errorf("[RTSP] Error opening %s: %v", rtspURL, err)
 		webRTCMutex.Lock()
 		delete(webRtcs, rtspURL)
 		webRTCMutex.Unlock()
@@ -315,10 +382,11 @@ func runRTSPClient(client *WebRTCClient, timeout int64) {
 	}
 
 	close(client.Ready) // 标记 RTSP 已就绪
+	logrus.Infof("[RTSP] Successfully started reading stream %s", rtspURL)
 
 	// 阻塞并运行 Client, 直到遇到错误或关闭
 	if err := rtspClient.Client.Wait(); err != nil {
-		fmt.Printf("[RTSP] Client finished with err: %v\n", err)
+		logrus.Errorf("[RTSP] Client finished with err: %v", err)
 	}
 
 	// 退出后进行清理

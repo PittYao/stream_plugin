@@ -2,7 +2,6 @@ package main
 
 import (
 	"embed"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -10,7 +9,9 @@ import (
 
 	"github.com/PittYao/stream_plugin/config"
 	"github.com/PittYao/stream_plugin/handlers"
+	"github.com/PittYao/stream_plugin/logger"
 	"github.com/gin-gonic/gin"
+	"github.com/sirupsen/logrus"
 )
 
 //go:embed html
@@ -103,10 +104,13 @@ func getContentType(path string) string {
 }
 
 func main() {
+	// 初始化日志
+	logger.Init()
+
 	// 加载配置
 	cfg, err := config.Load("config.json")
 	if err != nil {
-		log.Printf("配置文件加载失败，使用默认配置: %v", err)
+		logrus.Warnf("配置文件加载失败，使用默认配置: %v", err)
 		cfg = &config.Config{
 			Server: config.ServerConfig{Port: 7779},
 		}
@@ -130,9 +134,9 @@ func main() {
 
 	// 启动服务器
 	addr := ":" + strconv.Itoa(cfg.Server.Port)
-	log.Printf("服务启动，监听端口: %d", cfg.Server.Port)
+	logrus.Infof("服务启动，监听端口: %d", cfg.Server.Port)
 	if err := r.Run(addr); err != nil {
-		log.Fatalf("服务启动失败: %v", err)
+		logrus.Fatalf("服务启动失败: %v", err)
 		os.Exit(1)
 	}
 }

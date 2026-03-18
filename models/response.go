@@ -2,15 +2,15 @@ package models
 
 // Response 通用响应结构
 type Response struct {
-	Code   int         `json:"code"`
+	Statu  int         `json:"statu"`
 	Result interface{} `json:"result"`
 	Msg    string      `json:"msg"`
 }
 
 // NewResponse 创建响应
-func NewResponse(code int, result interface{}, msg string) Response {
+func NewResponse(statu int, result interface{}, msg string) Response {
 	return Response{
-		Code:   code,
+		Statu:  statu,
 		Result: result,
 		Msg:    msg,
 	}

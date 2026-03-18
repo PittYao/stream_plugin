@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/pion/rtp"
+	"github.com/sirupsen/logrus"
 )
 
 // RTSPClient RTSP 客户端封装
@@ -29,10 +31,18 @@ type RTSPClient struct {
 
 // NewRTSPClient 创建 RTSP 客户端
 func NewRTSPClient() *RTSPClient {
+	tcpTransport := gortsplib.TransportTCP
 	return &RTSPClient{
 		Client: &gortsplib.Client{
-			// 如果内网摄像头可以使用 TCP，一般比 UDP 稳定
-			// Transport: (*gortsplib.Transport)(nil), // 自动
+			// 强制使用 TCP 传输，从源头上解决内网交换机或弱网导致的 UDP RTSP 丢包，大幅度减少卡顿
+			Transport: &tcpTransport,
+			OnDecodeError: func(err error) {
+				// 忽略 112 这类海康等摄像头经常自带的私有轨道/无用轨道的告警
+				if strings.Contains(err.Error(), "unknown payload type") {
+					return
+				}
+				logrus.Warnf("[RTSP Decode Warn] %v", err)
+			},
 		},
 	}
 }
@@ -105,13 +115,13 @@ func (r *RTSPClient) Open(rtspURL string) error {
 	if audioForma != nil && audioMedia != nil {
 		_, err = r.Client.Setup(session.BaseURL, audioMedia, 0, 0)
 		if err != nil {
-			fmt.Printf("[RTSP] Warning: failed to setup audio media: %v\n", err)
+			logrus.Warnf("[RTSP] Warning: failed to setup audio media: %v\n", err)
 			// 音频 setup 失败不影响视频
 			audioForma = nil
 			audioMedia = nil
 		} else {
 			r.HasAudio = true
-			fmt.Println("[RTSP] Audio track (PCMA/G711) detected and setup")
+			logrus.Infof("[RTSP] Audio track (PCMA/G711) detected and setup")
 		}
 	}
 

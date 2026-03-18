@@ -183,8 +183,7 @@
                 await pc.setLocalDescription(offer);
                 log("Local offer created and set.");
 
-                // Wait for ICE gathering to complete before sending SDP
-                // Doing it via Promise for cleaner code
+                // 使用 Promise 等待 ICE 收集完成，不设超时，因为后端必须拿到带有 candidate 的 SDP 才会返回
                 await new Promise((resolve) => {
                     if (pc.iceGatheringState === 'complete') {
                         resolve();
@@ -196,8 +195,6 @@
                             }
                         };
                         pc.addEventListener('icegatheringstatechange', checkState);
-                        // Timeout fallback after 2s
-                        setTimeout(resolve, 2000);
                     }
                 });
 
@@ -212,15 +209,17 @@
                     });
 
                     const res = await resp.json();
-                    log(`Server response code: ${res.code}, msg: ${res.msg}`);
+                    log(`Server response statu: ${res.statu}, msg: ${res.msg}`);
 
-                    if (res.code !== 0) {
+                    if (res.statu !== 0) {
                         log(`Error from server: ${res.msg}`);
                         return;
                     }
 
                     log("Received answer from server. Setting RemoteDescription...");
-                    const remoteSdp = atob(res.result);
+                    
+                    // 原版前端只接收 SDP
+                    const remoteSdp = atob(res.result.sdp ? res.result.sdp : res.result);
                     log(`Remote SDP length: ${remoteSdp.length}`);
 
                     await pc.setRemoteDescription(new RTCSessionDescription({
@@ -252,7 +251,7 @@
 
             $.get("/app/plugin/rtsp2webrtcEnd", { rtspUrl: rtspUrl }, function (res) {
                 let r = typeof res === 'string' ? JSON.parse(res) : res;
-                log(`Server stop response: ${r.msg || r.result}`);
+                log(`Server stop response: ${r.msg || JSON.stringify(r.result)}`);
             });
         }
     </script>
