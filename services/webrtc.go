@@ -312,9 +312,9 @@ func runRTSPClient(client *WebRTCClient, timeout int64) {
 
 		for _, v := range viewers {
 			if v.Track != nil {
-				// Webrtc 视频 Track 发送 RTP 前不需要修改时间戳和序列号，
-				// pion 会自动利用 Track 底层的 state machine 和 interceptor 进行重制。
-				// 我们需要传入的只是打包好 Payload 的 rtp.Packet 拷贝 (不直接改指针防止并发竞争)
+				// WebRTC 视频 Track 发送 RTP 前不需要手动修改时间戳和序列号，
+				// Pion 会自动利用 Track 底层的状态机 (TrackLocal) 和 Interceptors 进行重置与重新打包。
+				// 我们只需要传入原始 RTP 包的深拷贝，避免并发竞争。
 				outPkt := *pkt
 
 				if err := v.Track.WriteRTP(&outPkt); err != nil {

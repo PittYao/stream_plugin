@@ -12,7 +12,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// RTSPClient RTSP 客户端封装
+// RTSPClient 对 gortsplib 客户端的二次封装，支持 RTP 透传模式
 type RTSPClient struct {
 	Client      *gortsplib.Client
 	URI         string

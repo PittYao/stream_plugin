@@ -52,10 +52,10 @@ func StartPreviewHandler(c *gin.Context) {
 // StopPreviewHandler 处理停止预览请求
 func StopPreviewHandler(c *gin.Context) {
 	rtspURL := c.Query("rtspUrl")
-	// 注意：新版不再强制要求 viewerId，如果没有传，就只记录，等待网络层的 ConnectionStateFailed 来关闭流。
-	// 或者，如果前端只传了 rtspUrl，那我们只能强制删除整个 rtspUrl 对应下的所有流(即原有的 bug 逻辑)，以保证前端的 "强制关闭" 功能不死机。
-	// 但这会影响其他人观看。为了保证并发，我们忽略来自前端的、没有 ViewerID 的主动 Close 信号，
-	// 让 "断开" 完全交给 PC 层的 Disconnected / Failed 事件去触发 removeViewer。
+	// 注意：新版采用引用计数管理，不再强制要求前端传回 viewerId。
+	// 如果前端未传 viewerId，则依赖网络层的 ConnectionStateFailed 事件来自动清理失效连接。
+	// 为了兼容旧版“强制停止”逻辑，若只传 rtspUrl 则可能触发该流下的全局清理（不推荐并发场景使用）。
+	// 建议让“断开”逻辑完全交给 WebRTC 层的 Disconnected/Failed 事件触发 removeViewer，以实现平滑退出。
 	
 	if rtspURL == "" {
 		c.JSON(http.StatusBadRequest, models.Error("rtspUrl 不能为空"))
