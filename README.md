@@ -65,11 +65,7 @@ make windows
     "read_timeout": 30
   },
   "webrtc": {
-    "ice_servers": [
-      {
-        "urls": ["stun:stun.l.google.com:19302"]
-      }
-    ],
+    "ice_servers": [],
     "media_buf_size": 150
   }
 }
@@ -80,4 +76,4 @@ make windows
 日志文件存储在 `./logs/stream_plugin.log`。如果程序启动失败或播放卡顿，请优先检查此文件。
 
 ---
-*Created by Antigravity AI Assistant.*
+
