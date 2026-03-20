@@ -77,3 +77,11 @@ make windows
 
 ---
 
+## 摄像头参数限制
+
+只支持摄像头
+- 视频编码H264
+- 音频编码G.711
+
+![视频](./imgs/video.png)
+![音频](./imgs/audio.png)
